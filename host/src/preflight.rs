@@ -2,7 +2,6 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use native_tls::TlsConnector as NativeConnector;
 use rustls::ClientConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
@@ -33,43 +32,82 @@ fn tls_error(err: &str) -> bool {
     low.contains("tls") || low.contains("certificate") || low.contains("schannel") || low.contains("2146893048") || low.contains("invalid token") || low.contains("webpki")
 }
 
-fn rustls_config() -> Arc<ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Arc::new(config)
+fn rustls_config(insecure: bool) -> Arc<ClientConfig> {
+    if insecure {
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        Arc::new(config)
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(config)
+    }
 }
 
-fn connect_rustls(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn connect_rustls(url: &str, insecure: bool) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
     let request = url.into_client_request().map_err(|e| e.to_string())?;
     let uri = request.uri();
     let host = uri.host().ok_or_else(|| "no host".to_string())?;
     let port = uri.port_u16().unwrap_or(443);
     let addr = format!("{host}:{port}");
     let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
-    let connector = Connector::Rustls(rustls_config());
+    let connector = Connector::Rustls(rustls_config(insecure));
     tungstenite::client_tls_with_config(request, stream, None, Some(connector)).map_err(|e| e.to_string())
 }
 
-fn connect_insecure(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
-    let request = url.into_client_request().map_err(|e| e.to_string())?;
-    let uri = request.uri();
-    let host = uri.host().ok_or_else(|| "no host".to_string())?;
-    let port = uri.port_u16().unwrap_or(443);
-    let addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
-    let connector = NativeConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let tls = connector.connect(host, stream).map_err(|e| e.to_string())?;
-    tungstenite::client(request, MaybeTlsStream::NativeTls(tls)).map_err(|e| e.to_string())
-}
-
 pub fn connect_and_cache(host: &str, slot: &str, password: &str, dir: &PathBuf) -> Result<(), Gate> {
+    let ver = env!("CARGO_PKG_VERSION");
     let addr = host.trim().trim_start_matches("wss://").trim_start_matches("ws://").trim_end_matches('/');
     let addr = addr.replace(['\u{ff1a}', '\u{2236}'], ":");
     let local = addr.starts_with("127.") || addr.starts_with("localhost") || addr.starts_with("0.0.0.0") || addr.starts_with("[::1]");
@@ -81,26 +119,20 @@ pub fn connect_and_cache(host: &str, slot: &str, password: &str, dir: &PathBuf) 
     let fallback = !flags.lines().any(|l| l.trim() == "tls_fallback = false"); // on by default
 
     let (mut socket, _) = if local {
-        connect(&url).map_err(|e| classify(&e.to_string()))?
+        connect(&url).map_err(|e| classify(&format!("{ver} {e}")))?
     } else if ignore {
-        connect_insecure(&url).map_err(|e| classify(&e))?
+        // Pure rustls with no cert verification — never touches Schannel.
+        connect_rustls(&url, true).map_err(|e| classify(&format!("{ver} rustls-insecure: {e}")))?
     } else {
-        // Prefer rustls + webpki-roots (bundled Mozilla CAs, same approach as Archipelago's certifi).
-        match connect_rustls(&url) {
+        // Prefer rustls + webpki-roots (bundled Mozilla CAs).
+        match connect_rustls(&url, false) {
             Ok(pair) => pair,
             Err(e) => {
                 let msg = e.to_string();
-                // Fall back to native-tls (Schannel) if rustls fails.
-                match connect(&url) {
-                    Ok(pair) => pair,
-                    Err(e2) => {
-                        let msg2 = e2.to_string();
-                        if fallback && (tls_error(&msg) || tls_error(&msg2)) {
-                            connect_insecure(&url).map_err(|e| classify(&e))?
-                        } else {
-                            return Err(classify(&format!("rustls: {msg}; native-tls: {msg2}")));
-                        }
-                    }
+                if fallback && tls_error(&msg) {
+                    connect_rustls(&url, true).map_err(|e2| classify(&format!("{ver} rustls: {msg}; insecure: {e2}")))?
+                } else {
+                    return Err(classify(&format!("{ver} rustls: {msg}")));
                 }
             }
         }
