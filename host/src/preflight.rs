@@ -1,10 +1,15 @@
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use native_tls::TlsConnector;
+use native_tls::TlsConnector as NativeConnector;
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
 use tungstenite::client::IntoClientRequest;
+use tungstenite::Connector;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 pub enum Gate {
     InvalidSlot,
@@ -26,7 +31,22 @@ fn classify(err: &str) -> Gate {
 
 fn tls_error(err: &str) -> bool {
     let low = err.to_ascii_lowercase();
-    low.contains("tls") || low.contains("certificate") || low.contains("schannel") || low.contains("2146893048") || low.contains("invalid token")
+    low.contains("tls") || low.contains("certificate") || low.contains("schannel") || low.contains("2146893048") || low.contains("invalid token") || low.contains("webpki")
+}
+
+fn rustls_config() -> Arc<ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+fn connect_rustls(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
+    let request = url.into_client_request().map_err(|e| e.to_string())?;
+    let connector = Connector::Rustls(rustls_config());
+    tungstenite::connect_with_config(request, None, false, Some(connector)).map_err(|e| e.to_string())
 }
 
 fn connect_insecure(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
@@ -36,7 +56,7 @@ fn connect_insecure(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<
     let port = uri.port_u16().unwrap_or(443);
     let addr = format!("{host}:{port}");
     let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
-    let connector = TlsConnector::builder()
+    let connector = NativeConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
         .build()
@@ -56,17 +76,27 @@ pub fn connect_and_cache(host: &str, slot: &str, password: &str, dir: &PathBuf) 
     let ignore = flags.lines().any(|l| l.trim() == "ignore_tls_errors = true");
     let fallback = !flags.lines().any(|l| l.trim() == "tls_fallback = false"); // on by default
 
-    let (mut socket, _) = if ignore && !local {
+    let (mut socket, _) = if local {
+        connect(&url).map_err(|e| classify(&e.to_string()))?
+    } else if ignore {
         connect_insecure(&url).map_err(|e| classify(&e))?
     } else {
-        match connect(&url) {
+        // Prefer rustls + webpki-roots (bundled Mozilla CAs, same approach as Archipelago's certifi).
+        match connect_rustls(&url) {
             Ok(pair) => pair,
             Err(e) => {
                 let msg = e.to_string();
-                if fallback && !local && tls_error(&msg) {
-                    connect_insecure(&url).map_err(|e| classify(&e))?
-                } else {
-                    return Err(classify(&msg));
+                // Fall back to native-tls (Schannel) if rustls fails.
+                match connect(&url) {
+                    Ok(pair) => pair,
+                    Err(e2) => {
+                        let msg2 = e2.to_string();
+                        if fallback && (tls_error(&msg) || tls_error(&msg2)) {
+                            connect_insecure(&url).map_err(|e| classify(&e))?
+                        } else {
+                            return Err(classify(&format!("rustls: {msg}; native-tls: {msg2}")));
+                        }
+                    }
                 }
             }
         }
@@ -75,6 +105,7 @@ pub fn connect_and_cache(host: &str, slot: &str, password: &str, dir: &PathBuf) 
     let tcp = match socket.get_ref() {
         MaybeTlsStream::Plain(stream) => stream,
         MaybeTlsStream::NativeTls(stream) => stream.get_ref(),
+        MaybeTlsStream::Rustls(stream) => stream.get_ref(),
         _ => return Err(Gate::Failed("unsupported socket".into())),
     };
     tcp.set_read_timeout(Some(Duration::from_secs(12))).ok();
