@@ -12,5 +12,7 @@ path = "src/main.rs"
 winres = "0.1"
 
 [dependencies]
-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls", "rustls-tls-webpki-roots"] }
 native-tls = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
