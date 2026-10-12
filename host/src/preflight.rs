@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use native_tls::TlsConnector as NativeConnector;
 use rustls::ClientConfig;
-use rustls::pki_types::ServerName;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
 use tungstenite::client::IntoClientRequest;
@@ -45,8 +44,13 @@ fn rustls_config() -> Arc<ClientConfig> {
 
 fn connect_rustls(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
     let request = url.into_client_request().map_err(|e| e.to_string())?;
+    let uri = request.uri();
+    let host = uri.host().ok_or_else(|| "no host".to_string())?;
+    let port = uri.port_u16().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+    let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
     let connector = Connector::Rustls(rustls_config());
-    tungstenite::connect_with_config(request, None, false, Some(connector)).map_err(|e| e.to_string())
+    tungstenite::client_tls_with_config(request, stream, None, Some(connector)).map_err(|e| e.to_string())
 }
 
 fn connect_insecure(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
