@@ -13,3 +13,4 @@ winres = "0.1"
 
 [dependencies]
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "native-tls"] }
+native-tls = "0.2"
