@@ -1,8 +1,10 @@
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
+use native_tls::TlsConnector;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message};
+use tungstenite::client::IntoClientRequest;
 
 pub enum Gate {
     InvalidSlot,
@@ -22,13 +24,54 @@ fn classify(err: &str) -> Gate {
     }
 }
 
+fn tls_error(err: &str) -> bool {
+    let low = err.to_ascii_lowercase();
+    low.contains("tls") || low.contains("certificate") || low.contains("schannel") || low.contains("2146893048") || low.contains("invalid token")
+}
+
+fn connect_insecure(url: &str) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), String> {
+    let request = url.into_client_request().map_err(|e| e.to_string())?;
+    let uri = request.uri();
+    let host = uri.host().ok_or_else(|| "no host".to_string())?;
+    let port = uri.port_u16().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+    let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
+    let connector = TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let tls = connector.connect(host, stream).map_err(|e| e.to_string())?;
+    tungstenite::client(request, MaybeTlsStream::NativeTls(tls)).map_err(|e| e.to_string())
+}
+
 pub fn connect_and_cache(host: &str, slot: &str, password: &str, dir: &PathBuf) -> Result<(), Gate> {
     let addr = host.trim().trim_start_matches("wss://").trim_start_matches("ws://").trim_end_matches('/');
     let addr = addr.replace(['\u{ff1a}', '\u{2236}'], ":");
     let local = addr.starts_with("127.") || addr.starts_with("localhost") || addr.starts_with("0.0.0.0") || addr.starts_with("[::1]");
     let addr = if addr.contains(':') { addr.to_string() } else { format!("{addr}:38281") };
     let url = if local { format!("ws://{addr}") } else { format!("wss://{addr}") };
-    let (mut socket, _) = connect(&url).map_err(|e| classify(&e.to_string()))?;
+
+    let flags = std::fs::read_to_string(dir.join("flags.toml")).unwrap_or_default();
+    let ignore = flags.lines().any(|l| l.trim() == "ignore_tls_errors = true");
+    let fallback = !flags.lines().any(|l| l.trim() == "tls_fallback = false"); // on by default
+
+    let (mut socket, _) = if ignore && !local {
+        connect_insecure(&url).map_err(|e| classify(&e))?
+    } else {
+        match connect(&url) {
+            Ok(pair) => pair,
+            Err(e) => {
+                let msg = e.to_string();
+                if fallback && !local && tls_error(&msg) {
+                    connect_insecure(&url).map_err(|e| classify(&e))?
+                } else {
+                    return Err(classify(&msg));
+                }
+            }
+        }
+    };
+
     let tcp = match socket.get_ref() {
         MaybeTlsStream::Plain(stream) => stream,
         MaybeTlsStream::NativeTls(stream) => stream.get_ref(),
